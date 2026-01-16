@@ -1,11 +1,12 @@
 [project]
 name = "code-gym-ai-investment"
-version = "0.1.0"
-description = "Add your description here"
+version = "0.2.0"
+description = "AI 股票趨勢分析系統 - 支援美股與台股，整合 OpenAI 和 Google Gemini"
 readme = "README.md"
 requires-python = ">=3.14"
 dependencies = [
     "openai>=2.15.0",
     "plotly>=6.5.1",
     "streamlit>=1.52.2",
+    "google-generativeai>=0.8.0",
 ]

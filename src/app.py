@@ -7,18 +7,161 @@ from openai import OpenAI
 from datetime import datetime, timedelta
 import json
 import numpy as np
+import re
+
+# 嘗試使用新版 google.genai，如果失敗則使用舊版
+try:
+    from google import genai
+    USING_NEW_GENAI = True
+except ImportError:
+    import google.generativeai as genai
+    USING_NEW_GENAI = False
 
 # 設置頁面配置
 st.set_page_config(
-    page_title="AI 股票趨勢分析系統",
+    page_title="AI 股票趨勢分析系統 (美股與台股)",
     page_icon="📈",
     layout="wide",
     initial_sidebar_state="expanded"
 )
 
 # 主標題
-st.title("📈 AI 股票趨勢分析系統")
+st.title("📈 AI 股票趨勢分析系統 (美股與台股)")
 st.divider()
+
+def is_taiwan_stock(symbol):
+    """
+    判斷股票代碼是否為台股（數字代碼）
+
+    Args:
+        symbol: 股票代碼
+
+    Returns:
+        bool: True 表示台股（純數字），False 表示美股（包含英文）
+    """
+    # 移除空白並轉換為大寫
+    symbol = symbol.strip().upper()
+    # 判斷是否為純數字（台股）
+    return symbol.isdigit()
+
+def get_taiwan_stock_data(symbol, api_key, start_date, end_date):
+    """
+    從 FindMind API 獲取台股歷史數據
+
+    Args:
+        symbol: 台股股票代碼（數字）
+        api_key: FindMind API金鑰（可為空）
+        start_date: 起始日期
+        end_date: 結束日期
+
+    Returns:
+        DataFrame: 包含股票歷史數據的DataFrame
+    """
+    try:
+        # 構建API請求URL
+        url = "https://api.finmindtrade.com/api/v4/data"
+        params = {
+            'dataset': 'TaiwanStockPrice',
+            'data_id': symbol,
+            'start_date': start_date.strftime('%Y-%m-%d'),
+            'end_date': end_date.strftime('%Y-%m-%d')
+        }
+
+        # 設置請求標頭（模擬瀏覽器）
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+            'Accept': 'application/json',
+            'Accept-Language': 'zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7',
+        }
+
+        # 只有在 API Key 不為空時才加入 Authorization
+        if api_key and api_key.strip():
+            headers['Authorization'] = f'Bearer {api_key}'
+
+        # 發送API請求
+        response = requests.get(url, params=params, headers=headers, timeout=30)
+
+        # 詳細的錯誤處理
+        if response.status_code != 200:
+            error_msg = f"FindMind API 請求失敗 (狀態碼: {response.status_code})"
+            try:
+                error_data = response.json()
+                if 'msg' in error_data:
+                    error_msg += f"\n錯誤訊息: {error_data['msg']}"
+            except:
+                error_msg += f"\n回應內容: {response.text[:200]}"
+            st.error(error_msg)
+            return None
+
+        data = response.json()
+
+        # 檢查API響應
+        if 'data' not in data or len(data['data']) == 0:
+            st.warning(f"FindMind API 回應中沒有股票 {symbol} 的數據。請確認：\n1. 股票代碼是否正確\n2. 日期範圍內是否有交易數據\n3. 是否需要 API Key")
+            return None
+
+        # 轉換為DataFrame
+        df = pd.DataFrame(data['data'])
+
+        # 調試資訊：顯示實際收到的欄位
+        if len(df) > 0:
+            st.info(f"📊 成功獲取 {len(df)} 筆資料。欄位：{', '.join(df.columns.tolist())}")
+
+        # FindMind API 的資料欄位映射與處理
+        # 需要將欄位名稱統一為標準格式：date, open, high, low, close, volume
+
+        # 嘗試轉換日期欄位
+        if 'date' in df.columns:
+            df['date'] = pd.to_datetime(df['date'])
+        else:
+            st.error("資料中缺少 'date' 欄位")
+            return None
+
+        # FindMind API 的欄位名稱映射（根據實際 API 回應）
+        # 實際欄位: date, stock_id, Trading_Volume, Trading_money, open, max, min, close, spread, Trading_turnover
+        column_mapping = {
+            'Trading_Volume': 'volume',      # 成交量
+            'Trading_money': 'trading_money', # 交易金額
+            'max': 'high',                    # 最高價
+            'min': 'low',                     # 最低價
+            'spread': 'spread',               # 漲跌幅
+            'Trading_turnover': 'turnover'    # 週轉率
+        }
+
+        # 檢查並重命名欄位
+        for old_col, new_col in column_mapping.items():
+            if old_col in df.columns:
+                df[new_col] = df[old_col]
+
+        # 確保必要欄位存在
+        required_columns = ['date', 'open', 'high', 'low', 'close', 'volume']
+        missing_columns = [col for col in required_columns if col not in df.columns]
+
+        if missing_columns:
+            st.error(f"資料欄位缺失：{', '.join(missing_columns)}")
+            st.info(f"可用欄位：{', '.join(df.columns.tolist())}")
+            return None
+
+        # 選擇需要的欄位並排序
+        df = df[required_columns].copy()
+        df = df.sort_values('date').reset_index(drop=True)
+
+        # 轉換資料型態
+        for col in ['open', 'high', 'low', 'close']:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+        df['volume'] = pd.to_numeric(df['volume'], errors='coerce')
+
+        # 移除包含 NaN 的行
+        df = df.dropna()
+
+        return df
+
+    except requests.exceptions.RequestException as e:
+        st.error(f"FindMind API請求失敗：{str(e)}")
+        return None
+    except Exception as e:
+        st.error(f"台股數據處理錯誤：{str(e)}")
+        return None
 
 def get_stock_data(symbol, api_key, start_date, end_date):
     """
@@ -147,7 +290,7 @@ def get_moving_averages(df):
 
     return df
 
-def create_enhanced_chart(df, symbol, rsi_period=14):
+def create_enhanced_chart(df, symbol, rsi_period=14, is_taiwan=False):
     """
     創建包含K線圖、移動平均線和RSI指標的綜合圖表
 
@@ -155,6 +298,7 @@ def create_enhanced_chart(df, symbol, rsi_period=14):
         df: 包含股票數據、移動平均線和RSI的DataFrame
         symbol: 股票代碼
         rsi_period: RSI計算週期
+        is_taiwan: 是否為台股
 
     Returns:
         plotly.graph_objects.Figure: 互動式圖表
@@ -274,8 +418,9 @@ def create_enhanced_chart(df, symbol, rsi_period=14):
     )
 
     # 更新佈局
+    stock_market = "台股" if is_taiwan else "美股"
     fig.update_layout(
-        title=f'{symbol} 股價技術分析圖表（含RSI指標）',
+        title=f'{symbol} 股價技術分析圖表（含RSI指標）- {stock_market}',
         height=900,
         showlegend=True,
         legend=dict(
@@ -289,8 +434,9 @@ def create_enhanced_chart(df, symbol, rsi_period=14):
     )
 
     # 更新各軸標籤
+    currency_label = "價格 (TWD)" if is_taiwan else "價格 (USD)"
     fig.update_xaxes(rangeslider_visible=False, row=1, col=1)
-    fig.update_yaxes(title_text="價格 (USD)", row=1, col=1)
+    fig.update_yaxes(title_text=currency_label, row=1, col=1)
     fig.update_yaxes(title_text="成交量", row=2, col=1)
     fig.update_yaxes(title_text="RSI", range=[0, 100], row=3, col=1)
 
@@ -313,14 +459,15 @@ def get_rsi_signal(current_rsi):
     else:
         return "正常區間", "🟡"
 
-def generate_ai_insights(symbol, stock_data, openai_api_key, start_date, end_date):
+def generate_ai_insights(symbol, stock_data, ai_api_key, ai_provider, start_date, end_date):
     """
-    使用OpenAI進行技術分析（包含RSI指標分析）
+    使用 AI 進行技術分析（支援 OpenAI 和 Google Gemini）
 
     Args:
         symbol: 股票代碼
         stock_data: 股票數據DataFrame
-        openai_api_key: OpenAI API金鑰
+        ai_api_key: AI API金鑰
+        ai_provider: AI 提供商 ('openai' 或 'gemini')
         start_date: 起始日期
         end_date: 結束日期
 
@@ -328,8 +475,6 @@ def generate_ai_insights(symbol, stock_data, openai_api_key, start_date, end_dat
         str: AI分析結果
     """
     try:
-        # 創建OpenAI客戶端
-        client = OpenAI(api_key=openai_api_key)
 
         # 準備數據
         first_date = stock_data['date'].iloc[0].strftime('%Y-%m-%d')
@@ -342,8 +487,18 @@ def generate_ai_insights(symbol, stock_data, openai_api_key, start_date, end_dat
         current_rsi = stock_data['rsi'].iloc[-1]
         rsi_signal, rsi_icon = get_rsi_signal(current_rsi)
 
-        # 轉換數據為JSON格式
-        data_json = stock_data.to_json(orient='records', date_format='iso')
+        # 準備關鍵數據摘要（避免傳送過多數據）
+        # 只傳送最近30筆和關鍵統計數據
+        recent_data = stock_data.tail(30)
+        data_json = recent_data.to_json(orient='records', date_format='iso')
+
+        # 計算關鍵統計數據
+        price_high = stock_data['close'].max()
+        price_low = stock_data['close'].min()
+        avg_volume = stock_data['volume'].mean()
+        current_ma5 = stock_data['MA5'].iloc[-1]
+        current_ma20 = stock_data['MA20'].iloc[-1]
+        current_ma60 = stock_data['MA60'].iloc[-1]
 
         # 構建AI提示語
         system_message = """你是一位專業的技術分析師，專精於股票技術分析和歷史數據解讀。你的職責包括：
@@ -376,75 +531,139 @@ def generate_ai_insights(symbol, stock_data, openai_api_key, start_date, end_dat
 
 ### 基本資訊
 - 股票代號：{symbol}
-- 分析期間：{first_date} 至 {last_date}
-- 期間價格變化：{price_change:.2f}% (從 ${start_price:.2f} 變化到 ${end_price:.2f})
-- 當前RSI值：{current_rsi:.2f} ({rsi_signal})
+- 分析期間：{first_date} 至 {last_date}（共 {len(stock_data)} 個交易日）
+- 起始價格：${start_price:.2f}
+- 結束價格：${end_price:.2f}
+- 期間價格變化：{price_change:.2f}%
+- 期間最高價：${price_high:.2f}
+- 期間最低價：${price_low:.2f}
+- 平均成交量：{avg_volume:,.0f}
 
-### 完整交易數據
-以下是該期間的完整交易數據，包含日期、開盤價、最高價、最低價、收盤價、成交量、移動平均線和RSI指標：
+### 當前技術指標
+- 當前 RSI：{current_rsi:.2f} ({rsi_signal})
+- MA5：${current_ma5:.2f}
+- MA20：${current_ma20:.2f}
+- MA60：${current_ma60:.2f}
+- 價格相對 MA20：{'上方' if end_price > current_ma20 else '下方'}
+
+### 最近30日交易數據
+以下是最近30個交易日的詳細數據（包含價格、成交量、移動平均線和RSI）：
 {data_json}
 
-### 分析架構：技術面完整分析
+### 請提供以下分析（請完整回答每個部分）：
 
-#### 1. 趨勢分析
-- 整體趨勢方向（上升、下降、盤整）
-- 關鍵支撐位和阻力位識別
-- 趨勢強度評估
+1. **趨勢分析**：整體方向、支撐阻力位
+2. **技術指標**：MA均線關係、RSI狀態、成交量分析
+3. **價格行為**：關鍵突破點、波動性
+4. **風險評估**：當前風險等級、支撐阻力區間
+5. **技術觀察**：短中期觀察重點
 
-#### 2. 技術指標分析
-- 移動平均線分析（短期與長期MA的關係）
-- 價格與移動平均線的相對位置
-- 成交量與價格變動的關聯性
+請確保分析內容完整且詳細（至少800字），包含具體數據支撐，使用繁體中文，條理清晰。"""
 
-#### 3. RSI分析（新增重點）
-- RSI指標當前狀態解讀
-- RSI歷史超買超賣區間分析
-- RSI與價格走勢的背離現象觀察
-- RSI動量變化趨勢分析
+        # 根據選擇的 AI 提供商調用對應 API
+        if ai_provider == "gemini":
+            # 使用 Google Gemini API
+            genai.configure(api_key=ai_api_key)
 
-#### 4. 價格行為分析
-- 重要的價格突破點
-- 波動性評估
-- 關鍵的轉折點識別
+            # Gemini 使用單一提示語（結合 system 和 user message）
+            combined_prompt = f"{system_message}\n\n{user_prompt}"
 
-#### 5. 風險評估
-- 當前價位的風險等級
-- 潛在的支撐和阻力區間
-- 市場情緒指標（包含RSI情緒判讀）
+            # 根據使用的套件版本選擇不同的調用方式
+            if USING_NEW_GENAI:
+                # 使用新版 google.genai
+                model = genai.GenerativeModel('gemini-2.5-pro')
+                response = model.generate_content(
+                    combined_prompt,
+                    config={
+                        'temperature': 0.3,
+                        'max_output_tokens': 8000,  # 增加到 8000
+                    }
+                )
+            else:
+                # 使用舊版 google.generativeai
+                model = genai.GenerativeModel('gemini-2.5-pro')
+                response = model.generate_content(
+                    combined_prompt,
+                    generation_config=genai.types.GenerationConfig(
+                        temperature=0.3,
+                        max_output_tokens=8000,  # 增加到 8000
+                    )
+                )
 
-#### 6. 市場觀察
-- 短期技術面觀察（1-2週）
-- 中期技術面觀察（1-3個月）
-- 關鍵價位觀察點
-- 技術面風險因子
-- RSI指標觀察重點
+            # 檢查回應是否有內容
+            if response and hasattr(response, 'text'):
+                text_content = response.text.strip()
+                if text_content and len(text_content) > 50:
+                    return text_content
+                else:
+                    st.warning(f"Gemini API 回應內容過短（{len(text_content)} 字元），可能不完整")
 
-### 綜合評估要求
-#### 輸出格式要求
-- 條理清晰，分段論述
-- 提供具體的數據支撐
-- 避免過於絕對的預測，強調分析的局限性
-- 在適當位置使用表格或重點標記
-- 特別著重RSI指標的教育性說明
+            # 嘗試從 parts 中提取文本
+            if response and hasattr(response, 'parts'):
+                text_parts = []
+                for part in response.parts:
+                    if hasattr(part, 'text') and part.text:
+                        text_parts.append(part.text.strip())
 
-分析目標：{symbol}"""
+                if text_parts:
+                    combined_text = '\n'.join(text_parts)
+                    if len(combined_text) > 50:
+                        return combined_text
+                    else:
+                        st.warning(f"Gemini API 回應內容過短（{len(combined_text)} 字元）")
 
-        # 調用OpenAI API (新版本)
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": system_message},
-                {"role": "user", "content": user_prompt}
-            ],
-            max_tokens=2500,
-            temperature=0.3
-        )
+            # 檢查是否有候選回應
+            if response and hasattr(response, 'candidates') and response.candidates:
+                candidate = response.candidates[0]
+                if hasattr(candidate, 'content') and candidate.content:
+                    if hasattr(candidate.content, 'parts'):
+                        text_parts = [p.text for p in candidate.content.parts if hasattr(p, 'text')]
+                        if text_parts:
+                            combined_text = '\n'.join(text_parts)
+                            if combined_text.strip():
+                                return combined_text
 
-        return response.choices[0].message.content
+            # 如果都沒有內容，返回錯誤訊息
+            st.error("⚠️ Gemini API 回應中沒有有效內容")
+            st.info("可能的原因：\n- 內容被安全過濾\n- API 回應格式變更\n- 網路連線問題")
+            return "Gemini AI 分析暫時無法生成完整內容。建議：\n1. 稍後重試\n2. 嘗試其他股票\n3. 切換到 OpenAI"
+
+        else:  # OpenAI (預設)
+            # 使用 OpenAI API
+            client = OpenAI(api_key=ai_api_key)
+
+            response = client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[
+                    {"role": "system", "content": system_message},
+                    {"role": "user", "content": user_prompt}
+                ],
+                max_tokens=2500,
+                temperature=0.3
+            )
+
+            return response.choices[0].message.content
 
     except Exception as e:
-        st.error(f"AI分析失敗：{str(e)}")
-        return "AI分析暫時無法使用，請檢查API金鑰或稍後再試。"
+        provider_name = "Google Gemini" if ai_provider == "gemini" else "OpenAI"
+        error_msg = str(e)
+
+        # 顯示詳細錯誤信息
+        st.error(f"{provider_name} AI 分析失敗：{error_msg}")
+
+        # 針對常見錯誤提供解決建議
+        if "API key" in error_msg or "authentication" in error_msg.lower():
+            st.warning("💡 提示：請檢查您的 API Key 是否正確")
+        elif "quota" in error_msg.lower() or "limit" in error_msg.lower():
+            st.warning("💡 提示：您可能已超過 API 使用配額，請稍後再試")
+        elif "safety" in error_msg.lower() or "blocked" in error_msg.lower():
+            st.warning("💡 提示：內容可能觸發安全過濾，請調整查詢參數")
+
+        # 顯示完整錯誤以便調試
+        with st.expander("🔍 查看詳細錯誤信息"):
+            st.code(error_msg)
+
+        return f"{provider_name} AI 分析暫時無法使用，請檢查上述錯誤訊息。"
 
 # 側邊欄設置
 st.sidebar.markdown("## 🔧 分析設定")
@@ -453,21 +672,56 @@ st.sidebar.divider()
 # 輸入控制項
 symbol = st.sidebar.text_input(
     "股票代碼",
-    value="AAPL",
-    help="輸入美股股票代碼，例如：AAPL, MSFT, GOOGL, TSLA"
+    value="TSLA",
+    help="輸入股票代碼：數字代碼為台股（如：2330），英文代碼為美股（如：TSLA, MSFT）"
 )
 
-fmp_api_key = st.sidebar.text_input(
-    "FMP API Key",
-    type="password",
-    help="請輸入您的Financial Modeling Prep API金鑰"
+# 判斷股票類型並動態顯示對應的 API Key 輸入框
+is_tw_stock = is_taiwan_stock(symbol) if symbol.strip() else False
+
+if is_tw_stock:
+    st.sidebar.info("🇹🇼 偵測到台股代碼，請輸入 FindMind API Key")
+    api_key = st.sidebar.text_input(
+        "FindMind API Key",
+        type="password",
+        help="請輸入您的 FindMind API 金鑰",
+        key="finmind_api_key"
+    )
+    stock_type = "台股"
+else:
+    st.sidebar.info("偵測到美股代碼，請輸入 FMP API Key")
+    api_key = st.sidebar.text_input(
+        "FMP API Key",
+        type="password",
+        help="請輸入您的 Financial Modeling Prep API 金鑰",
+        key="fmp_api_key"
+    )
+    stock_type = "美股"
+
+# AI 分析設定
+st.sidebar.markdown("### 🤖 AI 分析設定")
+ai_provider = st.sidebar.selectbox(
+    "選擇 AI 提供商",
+    options=["openai", "gemini"],  # 調整順序，openai 在前
+    index=0,  # 預設選擇第一個（openai）
+    format_func=lambda x: "OpenAI (GPT-4o-mini)" if x == "openai" else "Google Gemini (gemini-2.5-pro)",
+    help="選擇用於技術分析的 AI 模型"
 )
 
-openai_api_key = st.sidebar.text_input(
-    "OpenAI API Key",
-    type="password",
-    help="請輸入您的OpenAI API金鑰"
-)
+if ai_provider == "gemini":
+    ai_api_key = st.sidebar.text_input(
+        "Google Gemini API Key",
+        type="password",
+        help="請輸入您的 Google Gemini API 金鑰",
+        key="gemini_api_key"
+    )
+else:
+    ai_api_key = st.sidebar.text_input(
+        "OpenAI API Key",
+        type="password",
+        help="請輸入您的 OpenAI API 金鑰",
+        key="openai_api_key"
+    )
 
 # RSI參數設定（新增）
 st.sidebar.markdown("### 📊 RSI指標設定")
@@ -513,17 +767,16 @@ if analyze_button:
     # 輸入驗證
     if not symbol.strip():
         st.error("請輸入股票代碼")
-    elif not fmp_api_key.strip():
-        st.error("請輸入FMP API Key")
-    elif not openai_api_key.strip():
-        st.error("請輸入OpenAI API Key")
     elif start_date >= end_date:
         st.error("起始日期不能晚於或等於結束日期")
     else:
         # 開始分析流程
-        with st.spinner("正在獲取股票數據..."):
-            # 獲取股票數據
-            stock_data = get_stock_data(symbol.upper(), fmp_api_key, start_date, end_date)
+        with st.spinner(f"正在獲取{stock_type}數據..."):
+            # 根據股票類型獲取數據
+            if is_tw_stock:
+                stock_data = get_taiwan_stock_data(symbol, api_key, start_date, end_date)
+            else:
+                stock_data = get_stock_data(symbol.upper(), api_key, start_date, end_date)
 
             if stock_data is not None and len(stock_data) > 0:
                 st.success(f"成功獲取 {len(stock_data)} 筆交易數據")
@@ -542,12 +795,13 @@ if analyze_button:
 
                     if data_with_indicators is not None:
                         # 顯示綜合技術分析圖表（包含RSI）
-                        st.markdown("### 📊 股價K線圖與技術指標（含RSI）")
-                        chart = create_enhanced_chart(data_with_indicators, symbol.upper(), rsi_period)
+                        st.markdown(f"### 📊 {stock_type}股價K線圖與技術指標（含RSI）")
+                        display_symbol = symbol if is_tw_stock else symbol.upper()
+                        chart = create_enhanced_chart(data_with_indicators, display_symbol, rsi_period, is_tw_stock)
                         st.plotly_chart(chart, use_container_width=True)
 
                         # 基本統計資訊
-                        st.markdown("### 📈 基本統計資訊")
+                        st.markdown(f"### 📈 基本統計資訊 ({stock_type})")
                         col1, col2, col3, col4 = st.columns(4)
 
                         start_price = data_with_indicators['close'].iloc[0]
@@ -557,24 +811,26 @@ if analyze_button:
                         current_rsi = data_with_indicators['rsi'].iloc[-1]
                         rsi_signal, rsi_icon = get_rsi_signal(current_rsi)
 
+                        currency_symbol = "NT$" if is_tw_stock else "$"
+
                         with col1:
                             st.metric(
                                 "起始價格",
-                                f"${start_price:.2f}",
+                                f"{currency_symbol}{start_price:.2f}",
                                 help="分析期間第一個交易日的收盤價"
                             )
 
                         with col2:
                             st.metric(
                                 "結束價格",
-                                f"${end_price:.2f}",
+                                f"{currency_symbol}{end_price:.2f}",
                                 help="分析期間最後一個交易日的收盤價"
                             )
 
                         with col3:
                             st.metric(
                                 "價格變化",
-                                f"${price_change:.2f}",
+                                f"{currency_symbol}{price_change:.2f}",
                                 f"{price_change_pct:.2f}%",
                                 help="期間內的價格變化金額和百分比"
                             )
@@ -596,19 +852,25 @@ if analyze_button:
                         else:
                             st.success(f"🟡 RSI狀態：當前RSI值為 {current_rsi:.2f}，處於正常區間（30-70），技術面相對平衡。")
 
-                        # AI技術分析
-                        st.markdown("### 🤖 AI技術分析（含RSI指標解讀）")
-                        with st.spinner("AI 正在分析中..."):
-                            ai_analysis = generate_ai_insights(
-                                symbol.upper(),
-                                data_with_indicators,
-                                openai_api_key,
-                                start_date,
-                                end_date
-                            )
+                        # AI技術分析（僅在有 AI API Key 時執行）
+                        if ai_api_key and ai_api_key.strip():
+                            provider_name = "Google Gemini" if ai_provider == "gemini" else "OpenAI"
+                            st.markdown(f"### 🤖 AI技術分析（{provider_name}）- {stock_type}")
+                            with st.spinner(f"{provider_name} AI 正在分析中..."):
+                                ai_analysis = generate_ai_insights(
+                                    display_symbol,
+                                    data_with_indicators,
+                                    ai_api_key,
+                                    ai_provider,
+                                    start_date,
+                                    end_date
+                                )
 
-                        if ai_analysis:
-                            st.markdown(ai_analysis)
+                            if ai_analysis:
+                                st.markdown(ai_analysis)
+                        else:
+                            provider_name = "Google Gemini API Key" if ai_provider == "gemini" else "OpenAI API Key"
+                            st.info(f"💡 提示：輸入 {provider_name} 可獲得 AI 技術分析報告")
 
                         # 歷史數據表格
                         st.markdown("### 📋 歷史數據表格（含RSI指標）")
@@ -634,31 +896,39 @@ if analyze_button:
                             hide_index=True
                         )
 
-                        st.success("✅ 分析完成！包含RSI技術指標分析")
+                        st.success(f"✅ {stock_type}分析完成！包含RSI技術指標分析")
 
                 else:
                     st.warning("所選日期範圍內沒有交易數據，請調整日期範圍。")
             else:
-                st.error("無法獲取股票數據，請檢查股票代碼和API金鑰。")
+                st.error(f"無法獲取{stock_type}數據，請檢查股票代碼和API金鑰。")
 
 # 初始頁面說明
 if not analyze_button:
     st.markdown("""
-    ## 歡迎使用 AI 股票趨勢分析系統 👋
+    ## 歡迎使用 AI 股票趨勢分析系統 (美股與台股) 👋
 
     ### 🚀 功能特色
+    - **雙市場支援**: 同時支援美股與台股分析 🆕
     - **專業K線圖表**: 互動式價格圖表，包含移動平均線技術指標
-    - **RSI相對強弱指標**: 新增RSI技術指標，分析超買超賣狀態 🆕
+    - **RSI相對強弱指標**: 新增RSI技術指標，分析超買超賣狀態
     - **AI智能分析**: 使用先進AI模型進行深度技術面分析（含RSI解讀）
     - **歷史數據**: 詳細的股票歷史價格和成交量數據
     - **教育導向**: 客觀的技術分析，僅供學習研究使用
 
     ### 📝 使用方法
-    1. 在左側輸入股票代碼（如：AAPL, MSFT, GOOGL）
-    2. 輸入您的API金鑰（FMP和OpenAI）
-    3. 調整RSI計算週期（預設14天）🆕
-    4. 選擇分析的日期範圍
-    5. 點擊「開始分析」按鈕
+    1. 在左側輸入股票代碼：
+       - **台股**：輸入數字代碼（如：2330, 2317）🇹🇼
+       - **美股**：輸入英文代碼（如：TSLA, MSFT, GOOGL）🇺🇸
+    2. 系統會自動偵測股票類型並顯示對應的 API Key 輸入框
+    3. 輸入對應的 API 金鑰：
+       - **台股**：FindMind API Key（可選填）
+       - **美股**：FMP API Key（必填）
+    4. 選擇 AI 提供商（預設：OpenAI）
+    5. 輸入對應的 AI API Key（用於 AI 分析，可選填）
+    6. 調整 RSI 計算週期（預設 14 天）
+    7. 選擇分析的日期範圍
+    8. 點擊「開始分析」按鈕
 
     ### 💡 技術指標說明
     - **MA5**: 5日移動平均線，短期趨勢指標
@@ -681,8 +951,20 @@ if not analyze_button:
     其中 RS = 平均漲幅 / 平均跌幅（通常使用14日期間）
 
     ### 🔑 API金鑰獲取
-    - **FMP API**: 前往 [Financial Modeling Prep](https://financialmodelingprep.com/developer/docs) 註冊
-    - **OpenAI API**: 前往 [OpenAI Platform](https://platform.openai.com) 註冊
+    - **台股 FindMind API**: 前往 [FinMind](https://finmindtrade.com/) 註冊 🇹🇼
+    - **美股 FMP API**: 前往 [Financial Modeling Prep](https://financialmodelingprep.com/developer/docs) 註冊 🇺🇸
+    - **AI 分析**（擇一使用）：
+      - **OpenAI API**: 前往 [OpenAI Platform](https://platform.openai.com) 註冊
+        - 模型：GPT-4o-mini（預設）
+        - 穩定可靠，回應品質一致
+      - **Google Gemini API**: 前往 [Google AI Studio](https://aistudio.google.com/app/apikey) 取得
+        - 模型：gemini-2.5-pro（高階推理模型）
+        - 免費額度高，適合新手
+        - 推理能力強，分析深入
+
+    ### 🎯 範例
+    - **台股範例**：2330（台積電）、2317（鴻海）、2454（聯發科）
+    - **美股範例**：TSLA（蘋果）、MSFT（微軟）、GOOGL（Google）、TSLA（特斯拉）
 
     ---
     **開始您的技術分析之旅吧！** 📈
